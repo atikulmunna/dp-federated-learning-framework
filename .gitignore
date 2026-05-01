@@ -4,11 +4,11 @@
 .~lock.*
 
 # Experiment artifacts and datasets
-runs/
-data/
-datasets/
-outputs/
-checkpoints/
+/runs/
+/data/
+/datasets/
+/outputs/
+/checkpoints/
 wandb/
 mlruns/
 
