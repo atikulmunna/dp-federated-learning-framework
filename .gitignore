@@ -1,0 +1,39 @@
+# Local project specifications and Word temporary files
+*.docx
+~$*.docx
+.~lock.*
+
+# Experiment artifacts and datasets
+runs/
+data/
+datasets/
+outputs/
+checkpoints/
+wandb/
+mlruns/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment and local configuration
+.env
+.env.*
+*.local
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
