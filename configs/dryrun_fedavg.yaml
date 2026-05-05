@@ -1,0 +1,14 @@
+run:
+  id: dryrun_fedavg
+  output_dir: runs
+  seed: 123
+
+experiment:
+  mode: dryrun_fedavg
+  num_rounds: 5
+  num_clients: 10
+  cohort_size: 4
+  parameter_dim: 6
+  client_examples: 32
+  client_update_scale: 0.05
+  weighted_by_examples: false

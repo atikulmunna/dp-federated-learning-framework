@@ -35,7 +35,30 @@ Reported epsilon values are intended to represent cumulative privacy spend at th
 
 ## Repository Status
 
-This repository is currently being initialized from the project specification. Implementation code, experiment configs, tests, and dashboard components will be added incrementally.
+This repository now includes the first runnable dry-run experiment path. The dry run uses synthetic NumPy parameters to exercise configuration parsing, seed setup, FedAvg aggregation, and artifact writing without downloading datasets or requiring a GPU.
+
+## Quickstart
+
+Install the package in editable mode:
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
+Run the synthetic FedAvg dry run:
+
+```bash
+fldp-run --config configs/dryrun_fedavg.yaml
+```
+
+The command writes a local run directory under `runs/` containing:
+
+- `config.yaml`
+- `metadata.json`
+- `metrics.jsonl`
+- `summary.json`
+
+`runs/` is intentionally ignored by git.
 
 ## Proposed Structure
 

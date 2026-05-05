@@ -27,6 +27,9 @@ ml = [
   "flwr>=1.7",
 ]
 
+[project.scripts]
+fldp-run = "fldp.experiments.driver:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
