@@ -1,5 +1,6 @@
 """Federated aggregation strategies and parameter utilities."""
 
+from fldp.strategies.dp_fedavg import DPFedAvgResult, aggregate_dpfedavg
 from fldp.strategies.fedavg import (
     AggregationResult,
     ClientUpdate,
@@ -20,7 +21,9 @@ __all__ = [
     "AggregationResult",
     "ArrayList",
     "ClientUpdate",
+    "DPFedAvgResult",
     "add_gaussian_noise",
+    "aggregate_dpfedavg",
     "aggregate_fedavg",
     "apply_delta",
     "clip_by_l2_norm",
