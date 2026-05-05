@@ -57,10 +57,11 @@ def create_cifar10_cnn(*, num_classes: int = 10) -> Any:
                 nn.GroupNorm(8, 128),
                 nn.ReLU(inplace=True),
                 nn.MaxPool2d(2),
+                nn.AdaptiveAvgPool2d((4, 4)),
             )
             self.classifier = nn.Sequential(
                 nn.Flatten(),
-                nn.Linear(128 * 8 * 8, 128),
+                nn.Linear(128 * 4 * 4, 128),
                 nn.ReLU(inplace=True),
                 nn.Linear(128, num_classes),
             )
