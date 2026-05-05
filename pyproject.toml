@@ -22,6 +22,8 @@ dev = [
 ml = [
   "torch>=2.0",
   "torchvision>=0.15",
+  "opacus>=1.4",
+  "flwr>=1.7",
 ]
 
 [tool.setuptools.packages.find]
