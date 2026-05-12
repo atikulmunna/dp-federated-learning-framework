@@ -1,0 +1,21 @@
+run:
+  id: mnist_torch_smoke
+  output_dir: runs
+  seed: 123
+
+experiment:
+  mode: torch_fedavg_smoke
+  dataset: mnist
+  model: mnist_cnn
+  download: true
+  max_samples: 512
+  validation_fraction: 0.2
+  num_rounds: 2
+  num_clients: 8
+  cohort_size: 4
+  batch_size: 32
+  local_epochs: 1
+  learning_rate: 0.01
+  client_min_size: 1
+  device: cpu
+  weighted_by_examples: false
