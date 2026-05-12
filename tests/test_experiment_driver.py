@@ -61,6 +61,40 @@ def _write_torch_smoke_config(tmp_path: Path, *, run_id: str = "torch-smoke") ->
     return path
 
 
+def _write_torch_dp_smoke_config(tmp_path: Path, *, run_id: str = "torch-dp-smoke") -> Path:
+    config = {
+        "run": {
+            "id": run_id,
+            "output_dir": str(tmp_path / "runs"),
+            "seed": 654,
+        },
+        "experiment": {
+            "mode": "torch_dpfedavg_smoke",
+            "dataset": "synthetic",
+            "model": "mnist_cnn",
+            "synthetic_num_samples": 48,
+            "synthetic_num_classes": 10,
+            "validation_fraction": 0.25,
+            "num_rounds": 2,
+            "num_clients": 4,
+            "cohort_size": 2,
+            "batch_size": 8,
+            "local_epochs": 1,
+            "learning_rate": 0.01,
+            "client_min_size": 1,
+            "device": "cpu",
+            "weighted_by_examples": False,
+            "clip_norm": 1.0,
+            "noise_multiplier": 1.25,
+            "delta": 1e-5,
+            "privacy_unit": "client",
+        },
+    }
+    path = tmp_path / f"{run_id}.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    return path
+
+
 def test_load_config_parses_dryrun_yaml(tmp_path) -> None:
     config_path = _write_config(tmp_path)
 
@@ -101,6 +135,18 @@ def test_load_config_parses_torch_smoke_yaml(tmp_path) -> None:
     assert config.torch_fedavg_smoke.batch_size == 8
 
 
+def test_load_config_parses_torch_dp_smoke_yaml(tmp_path) -> None:
+    config = load_config(_write_torch_dp_smoke_config(tmp_path))
+
+    assert config.mode == "torch_dpfedavg_smoke"
+    assert config.torch_dpfedavg_smoke is not None
+    assert config.torch_dpfedavg_smoke.base.dataset == "synthetic"
+    assert config.torch_dpfedavg_smoke.clip_norm == 1.0
+    assert config.torch_dpfedavg_smoke.noise_multiplier == 1.25
+    assert config.torch_dpfedavg_smoke.delta == 1e-5
+    assert config.torch_dpfedavg_smoke.privacy_unit == "client"
+
+
 def test_parse_config_rejects_unknown_torch_dataset() -> None:
     with pytest.raises(ValueError, match="dataset"):
         parse_config(
@@ -117,6 +163,31 @@ def test_parse_config_rejects_unknown_torch_dataset() -> None:
                     "local_epochs": 1,
                     "learning_rate": 0.01,
                     "validation_fraction": 0.2,
+                },
+            }
+        )
+
+
+def test_parse_config_rejects_non_client_dp_privacy_unit() -> None:
+    with pytest.raises(ValueError, match="privacy_unit"):
+        parse_config(
+            {
+                "run": {"seed": 1},
+                "experiment": {
+                    "mode": "torch_dpfedavg_smoke",
+                    "dataset": "synthetic",
+                    "model": "mnist_cnn",
+                    "num_rounds": 1,
+                    "num_clients": 2,
+                    "cohort_size": 1,
+                    "batch_size": 4,
+                    "local_epochs": 1,
+                    "learning_rate": 0.01,
+                    "validation_fraction": 0.2,
+                    "clip_norm": 1.0,
+                    "noise_multiplier": 1.0,
+                    "delta": 1e-5,
+                    "privacy_unit": "sample",
                 },
             }
         )
@@ -171,6 +242,37 @@ def test_run_experiment_writes_torch_smoke_artifacts(tmp_path) -> None:
     assert summary["final_metrics"]["validation_accuracy"] == metrics[-1]["validation_accuracy"]
 
 
+def test_run_experiment_writes_torch_dp_smoke_artifacts_and_accountant_trace(tmp_path) -> None:
+    config = load_config(_write_torch_dp_smoke_config(tmp_path))
+
+    paths = run_experiment(config, repo_path=tmp_path)
+
+    metrics = read_jsonl(paths.metrics)
+    summary = json.loads(paths.summary.read_text(encoding="utf-8"))
+    trace = json.loads(paths.accountant_trace.read_text(encoding="utf-8"))
+
+    assert len(metrics) == 2
+    assert [row["round"] for row in metrics] == [1, 2]
+    assert all(row["cohort_size"] == 2 for row in metrics)
+    assert all(row["sample_rate"] == 0.5 for row in metrics)
+    assert all(row["clip_norm"] == 1.0 for row in metrics)
+    assert all(row["noise_multiplier"] == 1.25 for row in metrics)
+    assert all(row["noise_std"] == 0.625 for row in metrics)
+    assert all(row["epsilon_cumulative"] > 0 for row in metrics)
+    assert all(row["pre_clip_l2_max"] >= row["pre_clip_l2_mean"] for row in metrics)
+    assert all(0 < row["clip_scale_min"] <= 1 for row in metrics)
+    assert summary["mode"] == "torch_dpfedavg_smoke"
+    assert summary["privacy_unit"] == "client"
+    assert summary["epsilon_cumulative_final"] == metrics[-1]["epsilon_cumulative"]
+    assert trace["privacy_unit"] == "client"
+    assert trace["delta"] == 1e-5
+    assert trace["epsilon_cumulative_final"] == summary["epsilon_cumulative_final"]
+    assert trace["steps"] == [
+        {"round": 1, "noise_multiplier": 1.25, "sample_rate": 0.5},
+        {"round": 2, "noise_multiplier": 1.25, "sample_rate": 0.5},
+    ]
+
+
 def test_run_experiment_is_deterministic_for_same_config_and_seed(tmp_path) -> None:
     first_config = load_config(_write_config(tmp_path, run_id="first"))
     second_config = load_config(_write_config(tmp_path, run_id="second"))
@@ -192,6 +294,19 @@ def test_torch_smoke_run_is_deterministic_for_same_config_and_seed(tmp_path) -> 
     second = run_experiment(second_config, repo_path=tmp_path)
 
     assert read_jsonl(first.metrics) == read_jsonl(second.metrics)
+
+
+def test_torch_dp_smoke_run_is_deterministic_for_same_config_and_seed(tmp_path) -> None:
+    first_config = load_config(_write_torch_dp_smoke_config(tmp_path, run_id="first-dp"))
+    second_config = load_config(_write_torch_dp_smoke_config(tmp_path, run_id="second-dp"))
+
+    first = run_experiment(first_config, repo_path=tmp_path)
+    second = run_experiment(second_config, repo_path=tmp_path)
+
+    assert read_jsonl(first.metrics) == read_jsonl(second.metrics)
+    first_trace = json.loads(first.accountant_trace.read_text(encoding="utf-8"))
+    second_trace = json.loads(second.accountant_trace.read_text(encoding="utf-8"))
+    assert first_trace == second_trace
 
 
 def test_driver_main_prints_run_directory(tmp_path, capsys) -> None:
