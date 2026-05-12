@@ -16,6 +16,7 @@ from fldp.artifacts import (
     append_round_metrics,
     collect_environment_metadata,
     create_run_dir,
+    write_accountant_trace,
     write_config,
     write_metadata,
     write_summary,
@@ -29,7 +30,8 @@ from fldp.data import (
     make_train_validation_split,
 )
 from fldp.models import create_mnist_cnn
-from fldp.strategies import ClientUpdate, aggregate_fedavg, sample_cohort
+from fldp.privacy import PrivacyAccountant
+from fldp.strategies import ClientUpdate, aggregate_dpfedavg, aggregate_fedavg, sample_cohort
 from fldp.strategies.parameters import l2_norm
 from fldp.train import evaluate, get_model_parameters, seed_everything, set_model_parameters, train_one_epoch
 
@@ -79,6 +81,17 @@ class TorchFedAvgSmokeConfig:
 
 
 @dataclass(frozen=True)
+class TorchDPFedAvgSmokeConfig:
+    """Small PyTorch DP-FedAvg configuration for smoke runs."""
+
+    base: TorchFedAvgSmokeConfig
+    clip_norm: float
+    noise_multiplier: float
+    delta: float
+    privacy_unit: str = "client"
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     """Top-level experiment configuration."""
 
@@ -86,6 +99,7 @@ class ExperimentConfig:
     mode: str
     dryrun_fedavg: DryRunFedAvgConfig
     torch_fedavg_smoke: TorchFedAvgSmokeConfig | None
+    torch_dpfedavg_smoke: TorchDPFedAvgSmokeConfig | None
     raw: dict[str, Any]
 
 
@@ -107,7 +121,7 @@ def parse_config(raw: Mapping[str, Any]) -> ExperimentConfig:
     run_raw = _required_mapping(raw, "run")
     experiment_raw = _required_mapping(raw, "experiment")
     mode = str(experiment_raw.get("mode", "dryrun_fedavg"))
-    if mode not in {"dryrun_fedavg", "torch_fedavg_smoke"}:
+    if mode not in {"dryrun_fedavg", "torch_fedavg_smoke", "torch_dpfedavg_smoke"}:
         raise ValueError(f"unsupported experiment mode: {mode}")
 
     run = RunConfig(
@@ -117,12 +131,14 @@ def parse_config(raw: Mapping[str, Any]) -> ExperimentConfig:
     )
     dryrun = _parse_dryrun_config(experiment_raw)
     torch_smoke = _parse_torch_smoke_config(experiment_raw) if mode == "torch_fedavg_smoke" else None
+    torch_dp_smoke = _parse_torch_dp_smoke_config(experiment_raw) if mode == "torch_dpfedavg_smoke" else None
 
     return ExperimentConfig(
         run=run,
         mode=mode,
         dryrun_fedavg=dryrun,
         torch_fedavg_smoke=torch_smoke,
+        torch_dpfedavg_smoke=torch_dp_smoke,
         raw=dict(raw),
     )
 
@@ -148,6 +164,10 @@ def run_experiment(config: ExperimentConfig, *, repo_path: str | Path = ".") -> 
         if config.torch_fedavg_smoke is None:
             raise ValueError("torch_fedavg_smoke config is required")
         summary = run_torch_fedavg_smoke(config.torch_fedavg_smoke, paths=paths, seed=config.run.seed)
+    elif config.mode == "torch_dpfedavg_smoke":
+        if config.torch_dpfedavg_smoke is None:
+            raise ValueError("torch_dpfedavg_smoke config is required")
+        summary = run_torch_dpfedavg_smoke(config.torch_dpfedavg_smoke, paths=paths, seed=config.run.seed)
     else:  # pragma: no cover - parse_config prevents this branch.
         raise ValueError(f"unsupported experiment mode: {config.mode}")
 
@@ -321,6 +341,143 @@ def run_torch_fedavg_smoke(
     }
 
 
+def run_torch_dpfedavg_smoke(
+    config: TorchDPFedAvgSmokeConfig,
+    *,
+    paths: RunPaths,
+    seed: int,
+) -> dict[str, Any]:
+    """Run a small PyTorch DP-FedAvg smoke experiment."""
+
+    torch = _require_torch()
+    base = config.base
+    rng = np.random.default_rng(seed)
+    noise_rng = np.random.default_rng(seed + 1)
+    accountant = PrivacyAccountant()
+    dataset = _load_torch_smoke_dataset(base, seed=seed)
+    if base.max_samples is not None:
+        dataset = IndexedSubset(dataset, np.arange(min(base.max_samples, len(dataset))))
+
+    split = make_train_validation_split(
+        len(dataset),
+        validation_fraction=base.validation_fraction,
+        seed=seed,
+    )
+    partition = iid_partition(
+        len(split.train_indices),
+        base.num_clients,
+        seed=seed,
+        min_client_size=base.client_min_size,
+    )
+    client_datasets = make_client_datasets(dataset, split, partition)
+    validation_loader = make_dataloader(
+        client_datasets.validation,
+        batch_size=base.batch_size,
+        shuffle=False,
+    )
+
+    global_model = _create_torch_smoke_model(base)
+    server_parameters = list(get_model_parameters(global_model))
+    final_metrics: dict[str, float] = {}
+
+    for round_index in range(1, base.num_rounds + 1):
+        cohort = sample_cohort(
+            num_clients=base.num_clients,
+            cohort_size=base.cohort_size,
+            rng=rng,
+        )
+        updates = []
+        for client_id in cohort:
+            client_model = _create_torch_smoke_model(base)
+            set_model_parameters(client_model, server_parameters)
+            optimizer = torch.optim.SGD(client_model.parameters(), lr=base.learning_rate)
+            train_metrics = None
+            for _ in range(base.local_epochs):
+                train_loader = make_dataloader(
+                    client_datasets.clients[client_id],
+                    batch_size=base.batch_size,
+                    shuffle=True,
+                    seed=seed + round_index * 10_000 + client_id,
+                )
+                train_metrics = train_one_epoch(client_model, train_loader, optimizer, device=base.device)
+            if train_metrics is None:  # pragma: no cover - local_epochs validation prevents this.
+                raise RuntimeError("local training did not run")
+
+            updates.append(
+                ClientUpdate(
+                    client_id=client_id,
+                    initial_parameters=tuple(array.copy() for array in server_parameters),
+                    updated_parameters=get_model_parameters(client_model),
+                    num_examples=len(client_datasets.clients[client_id]),
+                    metrics={"train_loss": train_metrics.loss},
+                )
+            )
+
+        result = aggregate_dpfedavg(
+            server_parameters,
+            updates,
+            clip_norm=config.clip_norm,
+            noise_multiplier=config.noise_multiplier,
+            accountant=accountant,
+            num_total_clients=base.num_clients,
+            noise_rng=noise_rng,
+            delta=config.delta,
+        )
+        server_parameters = result.parameters
+        set_model_parameters(global_model, server_parameters)
+        validation_metrics = evaluate(global_model, validation_loader, device=base.device)
+        final_metrics = {
+            "train_loss": _mean_update_metric(updates, "train_loss"),
+            "validation_loss": validation_metrics.loss,
+            "validation_accuracy": validation_metrics.accuracy,
+            "epsilon_cumulative": result.epsilon if result.epsilon is not None else float("nan"),
+            "sample_rate": result.sample_rate,
+            "clip_norm": config.clip_norm,
+            "noise_multiplier": config.noise_multiplier,
+            "noise_std": result.noise_std,
+            "pre_clip_l2_mean": float(np.mean(result.pre_clip_norms)),
+            "pre_clip_l2_max": float(np.max(result.pre_clip_norms)),
+            "clip_scale_min": float(np.min(result.clip_scales)),
+            "average_clipped_delta_l2": l2_norm(result.average_clipped_delta),
+            "noised_delta_l2": l2_norm(result.noised_delta),
+            "parameter_l2": l2_norm(server_parameters),
+        }
+
+        append_round_metrics(
+            paths,
+            {
+                "round": round_index,
+                "cohort": list(cohort),
+                "cohort_size": result.cohort_size,
+                "num_examples": sum(update.num_examples for update in updates),
+                **final_metrics,
+            },
+        )
+
+    write_accountant_trace(
+        paths,
+        accountant,
+        delta=config.delta,
+        privacy_unit=config.privacy_unit,
+    )
+
+    return {
+        "mode": "torch_dpfedavg_smoke",
+        "status": "completed",
+        "dataset": base.dataset,
+        "model": base.model,
+        "rounds_completed": base.num_rounds,
+        "num_clients": base.num_clients,
+        "cohort_size": base.cohort_size,
+        "privacy_unit": config.privacy_unit,
+        "delta": config.delta,
+        "epsilon_cumulative_final": accountant.get_epsilon(delta=config.delta),
+        "clip_norm": config.clip_norm,
+        "noise_multiplier": config.noise_multiplier,
+        "final_metrics": final_metrics,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
 
@@ -408,6 +565,23 @@ def _parse_torch_smoke_config(experiment_raw: Mapping[str, Any]) -> TorchFedAvgS
     return config
 
 
+def _parse_torch_dp_smoke_config(experiment_raw: Mapping[str, Any]) -> TorchDPFedAvgSmokeConfig:
+    base = _parse_torch_smoke_config(experiment_raw)
+    privacy_unit = str(experiment_raw.get("privacy_unit", "client"))
+    if privacy_unit != "client":
+        raise ValueError("experiment.privacy_unit must be client")
+    return TorchDPFedAvgSmokeConfig(
+        base=base,
+        clip_norm=_positive_float(experiment_raw.get("clip_norm"), "experiment.clip_norm"),
+        noise_multiplier=_positive_float(
+            experiment_raw.get("noise_multiplier"),
+            "experiment.noise_multiplier",
+        ),
+        delta=_fraction(experiment_raw.get("delta"), "experiment.delta"),
+        privacy_unit=privacy_unit,
+    )
+
+
 def _load_torch_smoke_dataset(config: TorchFedAvgSmokeConfig, *, seed: int) -> Any:
     if config.dataset == "mnist":
         return load_vision_dataset("mnist", train=True, download=config.download)
@@ -432,6 +606,17 @@ def _create_torch_smoke_model(config: TorchFedAvgSmokeConfig) -> Any:
     if config.model == "mnist_cnn":
         return create_mnist_cnn(num_classes=config.synthetic_num_classes if config.dataset == "synthetic" else 10)
     raise ValueError(f"unsupported model: {config.model}")
+
+
+def _mean_update_metric(updates: list[ClientUpdate], metric_name: str) -> float:
+    values = [
+        float(update.metrics[metric_name])
+        for update in updates
+        if update.metrics and metric_name in update.metrics
+    ]
+    if not values:
+        raise ValueError(f"metric not found on updates: {metric_name}")
+    return sum(values) / len(values)
 
 
 def _required_mapping(raw: Mapping[str, Any], key: str) -> Mapping[str, Any]:
